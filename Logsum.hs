@@ -2,7 +2,7 @@
 
 module Logsum where
 
-import Prelude hiding (sum, foldr1, foldr)
+import Prelude hiding (sum, foldr1, foldr, foldl)
 
 import           Data.Semigroup
 import           Data.Pointed
@@ -11,7 +11,8 @@ import           Data.Foldable
 import           Data.Traversable
 
 import qualified Data.Map                   as M
-import qualified Data.ByteString.Lazy.Char8 as B
+import qualified Data.ByteString.Char8      as B
+import qualified Data.ByteString.Lazy.Char8 as LBS
 import qualified Data.Text                  as T
 import           Data.Aeson                 as A
 import qualified Data.Sequence              as Seq
@@ -85,9 +86,21 @@ instance Pointed MetricMap where
 instance Copointed LogEvent where
   copoint (LogEvent _ _ x) = x
 
--- misc instances
+-- Aeson instances, for rendering results.
+
 instance Show a => Show (LogEvent a) where
   show (LogEvent t0 t1 x) = "LogEvent " ++ (show . utctDayTime $ t0) ++ " " ++ (show . utctDayTime $ t1) ++ " " ++ (show x)
+
+instance ToString a => ToJSON (MetricMap a) where
+  toJSON = object . M.foldrWithKey insertKV mempty . deMetricMap
+
+insertKV k v xs = ( (T.pack . toString) k .= v) : xs
+
+instance ToJSON a => ToJSON (PriorityMap a) where
+  toJSON = object . M.foldrWithKey insertKV mempty . dePriorityMap
+
+instance ToJSON a => ToJSON (LogEvent a) where
+  toJSON (LogEvent s e x) = object ["start" .= timefmt s, "end" .= timefmt e, "event" .= x]
 
 instance ToJSON Metric where
   toJSON (Metric (count, duration)) = A.object ["count" .= count, "duration" .= duration]
@@ -95,9 +108,23 @@ instance ToJSON Metric where
 instance ToJSON NominalDiffTime where
   toJSON = String . T.pack . show
 
+instance ToJSON a => ToJSON (Seq a) where
+  toJSON = toJSON . toList
+
+class ToString a where
+  toString :: a -> String
+instance ToString B.ByteString where
+  toString = B.unpack
+instance ToString Priority where
+  toString = show
+
+
+{-
 instance Show a => Show (MetricMap a) where
   show = B.unpack . A.encode . M.mapKeys show . deMetricMap
+-}
 
+-- misc instances
 instance Functor LogEvent where
   fmap f (LogEvent s e x) = LogEvent s e (f x)
 
@@ -129,36 +156,37 @@ time desc f = do
   t0 <- getCurrentTime
   evaluate f
   t1 <- getCurrentTime
-  let level = if diffUTCTime t1 t0 > 0.1 then WARNING else INFO
+  let level = if diffUTCTime t1 t0 > 1.0 then WARNING else INFO
   return $ durationEvent level desc t0 t1
 
 -- insert an event into a log, dropping events that are older than a particular time
 insertEvent :: Semigroup a => NominalDiffTime -> LogEvent a -> Log a -> Log a
-insertEvent s x log = dropOld . compress . sortByTime $ log |> x  where
-  dropOld    = Seq.dropWhileL (\x -> averageTime (startTime x) (endTime x) < t)
-  t          = addUTCTime (-s) (startTime x)
+insertEvent s x log = dropOld . compress now . sortByTime $ log |> x where
+  now         = endTime x
+  dropOld    = Seq.dropWhileL (\y -> averageTime (startTime y) (endTime y) < t)
+  t          = addUTCTime (-s) now
   sortByTime = Seq.unstableSortBy (compare `on` startTime)
 
 -- compress log events that happened a long time ago so we can summarize
 -- log events and save memory.
-compress :: Semigroup a => Log a -> Log a
-compress log = case Seq.viewr log of
-  EmptyR  -> mempty
-  xs :> x -> compress' x mempty xs where
-    granularity y = diffUTCTime (startTime x) (startTime y) / 3.0
+--compress2 :: Semigroup m => UTCTime -> Log m -> Log m
+compress now log = case Seq.viewl log of
+  x :< xs -> snd r |> fst r where
+    r = foldl f (x, mempty) xs
+    timeSince     = diffUTCTime now . startTime
+    granularity x = (timeSince x) / 5.0
     shouldMerge x = duration x < granularity x
-    compress' x output input = case Seq.viewr input of
-      input' :> y -> if shouldMerge x && shouldMerge y
-                    then compress' (x <> y) output input'
-                    else compress' y (x <| output) input'
-      EmptyR      -> x <| output
+    f (buffer, output) x =
+      if shouldMerge (x <> buffer)
+      then (x <> buffer, output)
+      else (x, output |> buffer)
+  EmptyL  -> log
 
 -- get a summary of the events that happened in the past x seconds.
-logHistory :: (Monoid m, Semigroup m) => NominalDiffTime -> Log m -> m
-logHistory t log = case Seq.viewr log of
-  xs :> x -> copoint . fold1 . Seq.takeWhileR inRange $ xs |> x where
-      inRange y = diffUTCTime (endTime x) (startTime y) <= t
-  EmptyR  -> mempty
+logHistory :: (Monoid m, Semigroup m) =>
+  UTCTime -> NominalDiffTime -> Log m -> LogEvent m
+logHistory now t = fold1 . Seq.takeWhileR inRange where
+  inRange y = diffUTCTime now (startTime y) <= t
 
 -- A list of all of the names of a log event
 keysOf :: Ord k => LogEvent (PriorityMap (MetricMap k)) -> [k]
@@ -173,8 +201,8 @@ count :: Metric -> Int
 count (Metric (c, _)) = c
 
 foo m = do
-  n <- randomRIO (500000, 1000000) :: IO Int
-  x <- time (if n > 900000 then "foo" else "bar") (sum [1..n])
+  n <- randomRIO (50000, 100000) :: IO Int
+  x <- time (if n > 90000 then "foo" else "bar") (sum [1..n])
   log <- takeMVar m
   putMVar m $ insertEvent 2.0 x log
 
@@ -182,7 +210,16 @@ main = do
   logMVar <- newMVar mempty
   doFor (foo logMVar) 4.0
   log <- takeMVar logMVar
-  putStrLn . show . ofPriority (>INFO) . copoint . fold1 {- . logHistory 1.0 foldr1 (<>) -} $ log
+  putStrLn "= = = = Bleh = = = ="
+  putStrLn . LBS.unpack . A.encode $ log
+  putStrLn "= = = = Pretty Log = = = ="
+  printLog log
+  putStrLn "= = = = Warnings = = = = "
+  putStrLn . LBS.unpack . A.encode . ofPriority (>=WARNING) . copoint . fold1 $ log
+  putStrLn "= = = = Last Second Summary = = = ="
+  now <- getCurrentTime
+  putStrLn . LBS.unpack . A.encode . logHistory now 1.0 $ log
+  --putStrLn . show {- . ofPriority (>INFO) . copoint . fold1 . logHistory 1.0 foldr1 (<>) -} $ log
 
 doFor a t = do
   t0 <- getCurrentTime
@@ -202,6 +239,9 @@ printLog log = do
         timefmt = B.pack . formatTime defaultTimeLocale "%s%Q"
         values = map timefmt [start, end] <> map (B.pack . show) counts
     put values
+
+timefmt :: FormatTime a => a -> B.ByteString
+timefmt = B.pack . formatTime defaultTimeLocale "%s%Q"
 
 fold1 :: (Semigroup m, Foldable t) => t m -> m
 fold1 = foldr1 (<>)
