@@ -56,7 +56,8 @@ instance Ord a => Semigroup (MetricMap a) where
   x <> y = MetricMap $ (M.unionWith (<>) `on` deMetricMap) x y
 
 instance Semigroup a => Semigroup (LogEvent a) where
-  LogEvent begin end event <> LogEvent begin' end' event' = LogEvent (min begin begin') (max end end') (event <> event')
+  LogEvent begin end event <> LogEvent begin' end' event' =
+      LogEvent (min begin begin') (max end end') (event <> event')
 
 -- Monoid instances, for when we want an mempty
 instance Monoid Metric where
@@ -111,7 +112,11 @@ priorityMap :: Priority -> a -> PriorityMap a
 priorityMap p = PriorityMap . M.singleton p
 
 durationEvent :: Priority -> a -> UTCTime -> UTCTime ->  LogEvent (PriorityMap (MetricMap a))
-durationEvent priority thing start end = LogEvent start end . priorityMap priority . metricMap thing $ (metric start end)
+durationEvent priority thing start end =
+    LogEvent start end
+  . priorityMap priority
+  . metricMap thing $
+    metric start end
 
 -- Time related utility functions.
 duration :: LogEvent a -> NominalDiffTime
@@ -151,12 +156,13 @@ compress log = case Seq.viewr log of
 -- get a summary of the events that happened in the past x seconds.
 logHistory :: (Monoid m, Semigroup m) => NominalDiffTime -> Log m -> m
 logHistory t log = case Seq.viewr log of
-  xs :> x -> copoint . fold1 . Seq.takeWhileR (\y -> diffUTCTime (endTime x) (startTime y) <= t) $ xs |> x
+  xs :> x -> copoint . fold1 . Seq.takeWhileR inRange $ xs |> x where
+      inRange y = diffUTCTime (endTime x) (startTime y) <= t
   EmptyR  -> mempty
 
 -- A list of all of the names of a log event
 keysOf :: Ord k => LogEvent (PriorityMap (MetricMap k)) -> [k]
-keysOf =  M.keys . deMetricMap . fold .  M.elems . dePriorityMap . deLogEvent
+keysOf = M.keys . deMetricMap . fold .  M.elems . dePriorityMap . deLogEvent
 
 -- select metrics from a PriorityMap that satisfy a predicate that operates on
 -- the log event priority.
@@ -191,7 +197,8 @@ printLog log = do
       put = putStrLn . B.unpack . B.intercalate " "
   put headers
   for_ log $ \(LogEvent start end (PriorityMap mm)) -> do
-    let counts = map (\key ->  M.findWithDefault 0 key . M.map count . deMetricMap . fold $ mm) names
+    let counts = map getCount names
+        getCount k = M.findWithDefault 0 k . M.map count . deMetricMap . fold $ mm
         timefmt = B.pack . formatTime defaultTimeLocale "%s%Q"
         values = map timefmt [start, end] <> map (B.pack . show) counts
     put values
