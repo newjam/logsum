@@ -1,27 +1,40 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Logsum where
+module Logsum (
+    metric
+  , metricMap
+  , priorityMap
+  , durationEvent
+  , duration
+  , insertEvent
+  , logHistory
+  , ofPriority
+  , count
+  , printLog
+) where
 
-import Prelude hiding (sum, foldr1, foldr, foldl)
+import Prelude hiding (sum, foldr1, foldr, foldl, log)
 
 import           Data.Semigroup
 import           Data.Pointed
 import           Data.Copointed
 import           Data.Foldable
-import           Data.Traversable
+
+import           Control.Monad
 
 import qualified Data.Map                   as M
 import qualified Data.ByteString.Char8      as B
 import qualified Data.ByteString.Lazy.Char8 as LBS
 import qualified Data.Text                  as T
 import           Data.Aeson                 as A
+import           Data.Yaml                  as Y
+import qualified Data.Aeson.Encode.Pretty   as PA
 import qualified Data.Sequence              as Seq
-import           Data.Sequence (Seq, (<|), (|>), (><), ViewR (..), ViewL (..))
+import           Data.Sequence (Seq, (|>), ViewL(..))
 
 import Data.Time.Clock
 import Control.Exception.Base (evaluate)
 import Data.Function (on)
-import Data.String
 import Control.Concurrent.MVar
 import Control.Monad.Loops
 import System.Random
@@ -103,7 +116,7 @@ instance ToJSON a => ToJSON (LogEvent a) where
   toJSON (LogEvent s e x) = object ["start" .= timefmt s, "end" .= timefmt e, "event" .= x]
 
 instance ToJSON Metric where
-  toJSON (Metric (count, duration)) = A.object ["count" .= count, "duration" .= duration]
+  toJSON (Metric (c, d)) = A.object ["count" .= c, "duration" .= d]
 
 instance ToJSON NominalDiffTime where
   toJSON = String . T.pack . show
@@ -152,11 +165,12 @@ duration x = diffUTCTime (endTime x) (startTime x)
 averageTime :: UTCTime -> UTCTime -> UTCTime
 averageTime x y = addUTCTime ((diffUTCTime y x) / 2) x
 
+time :: a -> b -> IO (LogEvent (PriorityMap (MetricMap a)))
 time desc f = do
   t0 <- getCurrentTime
-  evaluate f
+  void $ evaluate f
   t1 <- getCurrentTime
-  let level = if diffUTCTime t1 t0 > 1.0 then WARNING else INFO
+  let level = if diffUTCTime t1 t0 > 0.05 then WARNING else INFO
   return $ durationEvent level desc t0 t1
 
 -- insert an event into a log, dropping events that are older than a particular time
@@ -169,17 +183,17 @@ insertEvent s x log = dropOld . compress now . sortByTime $ log |> x where
 
 -- compress log events that happened a long time ago so we can summarize
 -- log events and save memory.
---compress2 :: Semigroup m => UTCTime -> Log m -> Log m
+compress :: Semigroup m => UTCTime -> Log m -> Log m
 compress now log = case Seq.viewl log of
   x :< xs -> snd r |> fst r where
     r = foldl f (x, mempty) xs
     timeSince     = diffUTCTime now . startTime
-    granularity x = (timeSince x) / 5.0
-    shouldMerge x = duration x < granularity x
-    f (buffer, output) x =
-      if shouldMerge (x <> buffer)
-      then (x <> buffer, output)
-      else (x, output |> buffer)
+    granularity y = fromIntegral . round $ (timeSince y) / 2.0
+    shouldMerge y = duration y < granularity y
+    f (buffer, output) y =
+      if shouldMerge (y <> buffer)
+      then (y <> buffer, output)
+      else (y, output |> buffer)
   EmptyL  -> log
 
 -- get a summary of the events that happened in the past x seconds.
@@ -195,7 +209,7 @@ keysOf = M.keys . deMetricMap . fold .  M.elems . dePriorityMap . deLogEvent
 -- select metrics from a PriorityMap that satisfy a predicate that operates on
 -- the log event priority.
 ofPriority :: Monoid m => (Priority -> Bool) -> PriorityMap m -> m
-ofPriority pred = fold . M.filterWithKey (\k _ -> pred k) . dePriorityMap
+ofPriority p = fold . M.filterWithKey (\k _ -> p k) . dePriorityMap
 
 count :: Metric -> Int
 count (Metric (c, _)) = c
@@ -204,14 +218,15 @@ foo m = do
   n <- randomRIO (50000, 100000) :: IO Int
   x <- time (if n > 90000 then "foo" else "bar") (sum [1..n])
   log <- takeMVar m
-  putMVar m $ insertEvent 2.0 x log
+  putMVar m $ insertEvent 8.0 x log
 
+main :: IO ()
 main = do
   logMVar <- newMVar mempty
-  doFor (foo logMVar) 4.0
+  doFor (foo logMVar) 10.0
   log <- takeMVar logMVar
   putStrLn "= = = = Bleh = = = ="
-  putStrLn . LBS.unpack . A.encode $ log
+  putStrLn . B.unpack . Y.encode {- PA.encodePretty -} $ log
   putStrLn "= = = = Pretty Log = = = ="
   printLog log
   putStrLn "= = = = Warnings = = = = "
@@ -221,6 +236,7 @@ main = do
   putStrLn . LBS.unpack . A.encode . logHistory now 1.0 $ log
   --putStrLn . show {- . ofPriority (>INFO) . copoint . fold1 . logHistory 1.0 foldr1 (<>) -} $ log
 
+doFor :: IO a -> NominalDiffTime -> IO ()
 doFor a t = do
   t0 <- getCurrentTime
   untilM_ a (fmap (> addUTCTime t t0) getCurrentTime)
@@ -236,7 +252,7 @@ printLog log = do
   for_ log $ \(LogEvent start end (PriorityMap mm)) -> do
     let counts = map getCount names
         getCount k = M.findWithDefault 0 k . M.map count . deMetricMap . fold $ mm
-        timefmt = B.pack . formatTime defaultTimeLocale "%s%Q"
+        --timefmt = B.pack . formatTime defaultTimeLocale "%s%Q"
         values = map timefmt [start, end] <> map (B.pack . show) counts
     put values
 
